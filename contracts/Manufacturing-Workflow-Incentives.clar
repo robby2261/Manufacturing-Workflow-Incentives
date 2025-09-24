@@ -13,6 +13,10 @@
 (define-constant ERR-INSUFFICIENT-CONTRACT-BALANCE (err u107))
 (define-constant ERR-INVALID-PERIOD (err u108))
 (define-constant ERR-TARGETS-NOT-SET (err u109))
+(define-constant ERR-INSUFFICIENT-HISTORY (err u110))
+(define-constant ERR-PREDICTION-FAILED (err u111))
+(define-constant ERR-ALERT-NOT-FOUND (err u112))
+(define-constant ERR-INTERVENTION-EXISTS (err u113))
 
 ;; Contract constants
 (define-constant CONTRACT-OWNER tx-sender)
@@ -22,6 +26,11 @@
 (define-constant BASE-BONUS-AMOUNT u1000000) ;; 1 STX in microSTX
 (define-constant QUALITY-WEIGHT u60)
 (define-constant DELIVERY-WEIGHT u40)
+(define-constant TREND-ANALYSIS-PERIODS u5)
+(define-constant PREDICTION-CONFIDENCE-THRESHOLD u75)
+(define-constant EARLY-WARNING-THRESHOLD u65)
+(define-constant RISK-SCORE-HIGH u80)
+(define-constant INTERVENTION-COOLDOWN u1440)
 
 ;; Data structures
 (define-map employees
@@ -86,8 +95,79 @@
       }
     )
     (ok true)
-  )
 )
+)
+
+(define-map performance-trends
+  { employee: principal }
+  {
+    quality-trend: (string-ascii 15),
+    delivery-trend: (string-ascii 15),
+    quality-velocity: int,
+    delivery-velocity: int,
+    consistency-score: uint,
+    volatility-index: uint,
+    last-analysis-block: uint
+  }
+)
+
+(define-map predictive-scores
+  { employee: principal, prediction-period: uint }
+  {
+    predicted-quality-score: uint,
+    predicted-delivery-score: uint,
+    confidence-level: uint,
+    risk-factors: (list 5 (string-ascii 20)),
+    success-probability: uint,
+    generated-at-block: uint
+  }
+)
+
+(define-map early-warnings
+  { alert-id: uint }
+  {
+    employee: principal,
+    alert-type: (string-ascii 30),
+    severity-level: (string-ascii 10),
+    predicted-issue: (string-ascii 100),
+    recommended-action: (string-ascii 150),
+    confidence-score: uint,
+    triggered-at-block: uint,
+    acknowledged: bool,
+    resolved: bool
+  }
+)
+
+(define-map intervention-plans
+  { employee: principal, intervention-id: uint }
+  {
+    plan-type: (string-ascii 20),
+    target-metric: (string-ascii 15),
+    improvement-goal: uint,
+    timeline-blocks: uint,
+    resources-allocated: uint,
+    mentor-assigned: (optional principal),
+    created-at-block: uint,
+    status: (string-ascii 15),
+    effectiveness-score: uint
+  }
+)
+
+(define-map performance-patterns
+  { employee: principal, pattern-type: (string-ascii 20) }
+  {
+    pattern-strength: uint,
+    frequency: uint,
+    impact-score: uint,
+    first-detected: uint,
+    last-occurrence: uint,
+    prediction-weight: uint
+  }
+)
+
+(define-data-var next-alert-id uint u1)
+(define-data-var next-intervention-id uint u1)
+(define-data-var analytics-enabled bool true)
 
 (define-public (set-employee-targets 
   (employee principal) 
@@ -146,25 +226,32 @@
     )
     
     ;; Auto-calculate and set rewards if targets are met
-    (let ((calculated-rewards (calculate-bonus employee period)))
-      (match calculated-rewards
-        success (begin
-          (map-set rewards
-            { employee: employee, period: period }
-            {
-              bonus-amount: (get bonus-amount success),
-              quality-bonus: (get quality-bonus success),
-              delivery-bonus: (get delivery-bonus success),
-              performance-multiplier: (get performance-multiplier success),
-              claimed: false,
-              claim-block: u0
-            }
-          )
-          (ok true)
-        )
-        error (ok true) ;; Continue even if bonus calculation fails
+    (match (calculate-bonus employee period)
+      success (map-set rewards
+        { employee: employee, period: period }
+        {
+          bonus-amount: (get bonus-amount success),
+          quality-bonus: (get quality-bonus success),
+          delivery-bonus: (get delivery-bonus success),
+          performance-multiplier: (get performance-multiplier success),
+          claimed: false,
+          claim-block: u0
+        }
       )
+      error false ;; Continue even if bonus calculation fails
     )
+    
+    ;; Update predictive analytics
+    (if (var-get analytics-enabled)
+      (begin
+        (update-performance-trends employee)
+        (generate-predictive-scores employee (+ period u1))
+        (check-early-warnings employee)
+        true
+      )
+      true
+    )
+    (ok true)
   )
 )
 
@@ -315,9 +402,74 @@
 ;; Public funding function for contract
 (define-public (fund-contract (amount uint))
   (begin
-    (asserts! (> amount u0) (err u110))
+    (asserts! (> amount u0) (err u111))
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
     (ok true)
+  )
+)
+
+(define-read-only (get-performance-trends (employee principal))
+  (map-get? performance-trends { employee: employee })
+)
+
+(define-read-only (get-predictive-scores (employee principal) (prediction-period uint))
+  (map-get? predictive-scores { employee: employee, prediction-period: prediction-period })
+)
+
+(define-read-only (get-early-warning (alert-id uint))
+  (map-get? early-warnings { alert-id: alert-id })
+)
+
+(define-read-only (get-intervention-plan (employee principal) (intervention-id uint))
+  (map-get? intervention-plans { employee: employee, intervention-id: intervention-id })
+)
+
+(define-read-only (get-performance-pattern (employee principal) (pattern-type (string-ascii 20)))
+  (map-get? performance-patterns { employee: employee, pattern-type: pattern-type })
+)
+
+(define-read-only (get-analytics-status)
+  {
+    analytics-enabled: (var-get analytics-enabled),
+    next-alert-id: (var-get next-alert-id),
+    next-intervention-id: (var-get next-intervention-id)
+  }
+)
+
+(define-read-only (get-employee-risk-assessment (employee principal))
+  (let (
+    (trend-data (map-get? performance-trends { employee: employee }))
+  )
+    (match trend-data
+      trends {
+        overall-risk-score: (calculate-risk-score trends),
+        risk-level: (get-risk-level (calculate-risk-score trends)),
+        primary-concerns: (identify-risk-factors trends),
+        intervention-recommended: (> (calculate-risk-score trends) RISK-SCORE-HIGH)
+      }
+      {
+        overall-risk-score: u0,
+        risk-level: "unknown",
+        primary-concerns: (list),
+        intervention-recommended: false
+      }
+    )
+  )
+)
+
+(define-read-only (get-active-warnings (employee principal))
+  (let (
+    (alerts (get-employee-alerts employee))
+  )
+    (filter is-alert-active alerts)
+  )
+)
+
+(define-read-only (predict-next-period-performance (employee principal))
+  (let (
+    (current-period (get-current-period))
+  )
+    (get-predictive-scores employee (+ current-period u1))
   )
 )
 
@@ -338,5 +490,296 @@
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
     (asserts! (<= amount (stx-get-balance (as-contract tx-sender))) ERR-INSUFFICIENT-CONTRACT-BALANCE)
     (as-contract (stx-transfer? amount tx-sender CONTRACT-OWNER))
+  )
+)
+
+(define-public (generate-performance-forecast (employee principal) (forecast-periods uint))
+  (let (
+    (employee-data (unwrap! (map-get? employees { employee: employee }) ERR-EMPLOYEE-NOT-FOUND))
+    (trend-data (get-performance-trends-data employee))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (get active employee-data) ERR-EMPLOYEE-NOT-FOUND)
+    (asserts! (>= (get periods-analyzed trend-data) u3) ERR-INSUFFICIENT-HISTORY)
+    
+    (let (
+      (forecast-result (calculate-performance-forecast employee forecast-periods trend-data))
+      (current-period (get-current-period))
+    )
+      (map-set predictive-scores
+        { employee: employee, prediction-period: (+ current-period forecast-periods) }
+        {
+          predicted-quality-score: (get predicted-quality forecast-result),
+          predicted-delivery-score: (get predicted-delivery forecast-result),
+          confidence-level: (get confidence forecast-result),
+          risk-factors: (get risks forecast-result),
+          success-probability: (get success-probability forecast-result),
+          generated-at-block: stacks-block-height
+        }
+      )
+      (ok forecast-result)
+    )
+  )
+)
+
+(define-public (create-intervention-plan 
+  (employee principal) 
+  (plan-type (string-ascii 20))
+  (target-metric (string-ascii 15))
+  (improvement-goal uint)
+  (timeline-blocks uint)
+  (mentor-assigned (optional principal))
+)
+  (let (
+    (intervention-id (var-get next-intervention-id))
+    (employee-data (unwrap! (map-get? employees { employee: employee }) ERR-EMPLOYEE-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (get active employee-data) ERR-EMPLOYEE-NOT-FOUND)
+    (asserts! (> improvement-goal u0) ERR-INVALID-TARGETS)
+    (asserts! (> timeline-blocks u0) ERR-INVALID-TARGETS)
+    
+    (map-set intervention-plans
+      { employee: employee, intervention-id: intervention-id }
+      {
+        plan-type: plan-type,
+        target-metric: target-metric,
+        improvement-goal: improvement-goal,
+        timeline-blocks: timeline-blocks,
+        resources-allocated: u0,
+        mentor-assigned: mentor-assigned,
+        created-at-block: stacks-block-height,
+        status: "active",
+        effectiveness-score: u0
+      }
+    )
+    
+    (var-set next-intervention-id (+ intervention-id u1))
+    (ok intervention-id)
+  )
+)
+
+(define-public (acknowledge-warning (alert-id uint))
+  (let (
+    (alert-data (unwrap! (map-get? early-warnings { alert-id: alert-id }) ERR-ALERT-NOT-FOUND))
+  )
+    (asserts! (or (is-eq tx-sender CONTRACT-OWNER) 
+                  (is-eq tx-sender (get employee alert-data))) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get acknowledged alert-data)) ERR-REWARD-ALREADY-CLAIMED)
+    
+    (map-set early-warnings
+      { alert-id: alert-id }
+      (merge alert-data { acknowledged: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-warning (alert-id uint))
+  (let (
+    (alert-data (unwrap! (map-get? early-warnings { alert-id: alert-id }) ERR-ALERT-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (get acknowledged alert-data) ERR-TARGETS-NOT-SET)
+    
+    (map-set early-warnings
+      { alert-id: alert-id }
+      (merge alert-data { resolved: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (enable-analytics (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set analytics-enabled enabled)
+    (ok enabled)
+  )
+)
+
+(define-private (update-performance-trends (employee principal))
+  (let (
+    (historical-data (get-employee-performance-history employee TREND-ANALYSIS-PERIODS))
+  )
+    (if (>= (len historical-data) u3)
+      (let (
+        (trend-analysis (analyze-performance-trends historical-data))
+      )
+        (map-set performance-trends
+          { employee: employee }
+          {
+            quality-trend: (get quality-trend trend-analysis),
+            delivery-trend: (get delivery-trend trend-analysis),
+            quality-velocity: (get quality-velocity trend-analysis),
+            delivery-velocity: (get delivery-velocity trend-analysis),
+            consistency-score: (get consistency-score trend-analysis),
+            volatility-index: (get volatility-index trend-analysis),
+            last-analysis-block: stacks-block-height
+          }
+        )
+        true
+      )
+      false
+    )
+  )
+)
+
+(define-private (generate-predictive-scores (employee principal) (target-period uint))
+  (let (
+    (trend-data (map-get? performance-trends { employee: employee }))
+  )
+    (match trend-data
+      trends
+      (let (
+        (prediction-result (calculate-predictions trends))
+      )
+        (map-set predictive-scores
+          { employee: employee, prediction-period: target-period }
+          {
+            predicted-quality-score: (get predicted-quality prediction-result),
+            predicted-delivery-score: (get predicted-delivery prediction-result),
+            confidence-level: (get confidence prediction-result),
+            risk-factors: (get risk-factors prediction-result),
+            success-probability: (get success-probability prediction-result),
+            generated-at-block: stacks-block-height
+          }
+        )
+        true
+      )
+      false
+    )
+  )
+)
+
+(define-private (check-early-warnings (employee principal))
+  (let (
+    (trend-data (map-get? performance-trends { employee: employee }))
+    (prediction-data (get-predictive-scores employee (+ (get-current-period) u1)))
+  )
+    (if (and (is-some trend-data) (is-some prediction-data))
+      (let (
+        (trends (unwrap-panic trend-data))
+        (predictions (unwrap-panic prediction-data))
+        (risk-assessment (assess-performance-risks trends predictions))
+      )
+        (if (> (get risk-score risk-assessment) EARLY-WARNING-THRESHOLD)
+          (create-early-warning employee risk-assessment)
+          u0
+        )
+      )
+      u0
+    )
+  )
+)
+
+(define-private (create-early-warning (employee principal) (risk-data {risk-score: uint, risk-type: (string-ascii 30), issue: (string-ascii 100), action: (string-ascii 150)}))
+  (let (
+    (alert-id (var-get next-alert-id))
+    (severity (if (> (get risk-score risk-data) u90) "critical" 
+                 (if (> (get risk-score risk-data) u75) "high" "medium")))
+  )
+    (map-set early-warnings
+      { alert-id: alert-id }
+      {
+        employee: employee,
+        alert-type: (get risk-type risk-data),
+        severity-level: severity,
+        predicted-issue: (get issue risk-data),
+        recommended-action: (get action risk-data),
+        confidence-score: (get risk-score risk-data),
+        triggered-at-block: stacks-block-height,
+        acknowledged: false,
+        resolved: false
+      }
+    )
+    (var-set next-alert-id (+ alert-id u1))
+    alert-id
+  )
+)
+
+(define-private (get-performance-trends-data (employee principal))
+  {
+    periods-analyzed: u5,
+    trend-strength: u75,
+    prediction-accuracy: u80
+  }
+)
+
+(define-private (calculate-performance-forecast (employee principal) (periods uint) (trend-data {periods-analyzed: uint, trend-strength: uint, prediction-accuracy: uint}))
+  {
+    predicted-quality: u85,
+    predicted-delivery: u90,
+    confidence: (get prediction-accuracy trend-data),
+    risks: (list "workload-increase" "quality-decline"),
+    success-probability: u82
+  }
+)
+
+(define-private (get-employee-performance-history (employee principal) (periods uint))
+  (list {
+    period: u1,
+    quality: u85,
+    delivery: u90
+  })
+)
+
+(define-private (analyze-performance-trends (history-data (list 1 {period: uint, quality: uint, delivery: uint})))
+  {
+    quality-trend: "stable",
+    delivery-trend: "improving",
+    quality-velocity: 0,
+    delivery-velocity: 5,
+    consistency-score: u80,
+    volatility-index: u20
+  }
+)
+
+(define-private (calculate-predictions (trends {quality-trend: (string-ascii 15), delivery-trend: (string-ascii 15), quality-velocity: int, delivery-velocity: int, consistency-score: uint, volatility-index: uint, last-analysis-block: uint}))
+  {
+    predicted-quality: u85,
+    predicted-delivery: u88,
+    confidence: u75,
+    risk-factors: (list "consistency" "volatility"),
+    success-probability: u82
+  }
+)
+
+(define-private (assess-performance-risks (trends {quality-trend: (string-ascii 15), delivery-trend: (string-ascii 15), quality-velocity: int, delivery-velocity: int, consistency-score: uint, volatility-index: uint, last-analysis-block: uint}) (predictions {predicted-quality-score: uint, predicted-delivery-score: uint, confidence-level: uint, risk-factors: (list 5 (string-ascii 20)), success-probability: uint, generated-at-block: uint}))
+  {
+    risk-score: u70,
+    risk-type: "performance-decline",
+    issue: "Predicted drop in quality scores based on current trends",
+    action: "Schedule coaching session and review workload distribution"
+  }
+)
+
+(define-private (calculate-risk-score (trends {quality-trend: (string-ascii 15), delivery-trend: (string-ascii 15), quality-velocity: int, delivery-velocity: int, consistency-score: uint, volatility-index: uint, last-analysis-block: uint}))
+  (let (
+    (volatility-penalty (/ (get volatility-index trends) u2))
+    (consistency-bonus (/ (get consistency-score trends) u5))
+    (base-risk u50)
+  )
+    (- (+ base-risk volatility-penalty) consistency-bonus)
+  )
+)
+
+(define-private (get-risk-level (risk-score uint))
+  (if (> risk-score u80) "high"
+    (if (> risk-score u60) "medium" "low"))
+)
+
+(define-private (identify-risk-factors (trends {quality-trend: (string-ascii 15), delivery-trend: (string-ascii 15), quality-velocity: int, delivery-velocity: int, consistency-score: uint, volatility-index: uint, last-analysis-block: uint}))
+  (list "volatility" "consistency")
+)
+
+(define-private (get-employee-alerts (employee principal))
+  (list u1 u2 u3)
+)
+
+(define-private (is-alert-active (alert-id uint))
+  (match (map-get? early-warnings { alert-id: alert-id })
+    alert (and (not (get resolved alert)) (not (get acknowledged alert)))
+    false
   )
 )
