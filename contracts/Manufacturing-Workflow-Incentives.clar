@@ -17,6 +17,7 @@
 (define-constant ERR-PREDICTION-FAILED (err u111))
 (define-constant ERR-ALERT-NOT-FOUND (err u112))
 (define-constant ERR-INTERVENTION-EXISTS (err u113))
+(define-constant ERR-INVALID-RANK (err u114))
 
 ;; Contract constants
 (define-constant CONTRACT-OWNER tx-sender)
@@ -31,6 +32,8 @@
 (define-constant EARLY-WARNING-THRESHOLD u65)
 (define-constant RISK-SCORE-HIGH u80)
 (define-constant INTERVENTION-COOLDOWN u1440)
+(define-constant TOP-PERFORMER-THRESHOLD u90)
+(define-constant LEADERBOARD-SIZE u10)
 
 ;; Data structures
 (define-map employees
@@ -165,9 +168,44 @@
   }
 )
 
+(define-map leaderboard-rankings
+  { employee: principal, period: uint }
+  {
+    composite-score: uint,
+    department-rank: uint,
+    global-rank: uint,
+    percentile: uint,
+    is-top-performer: bool,
+    ranking-bonus: uint,
+    calculated-at-block: uint
+  }
+)
+
+(define-map department-stats
+  { department: (string-ascii 30), period: uint }
+  {
+    total-employees: uint,
+    average-quality: uint,
+    average-delivery: uint,
+    top-performer-count: uint,
+    total-units-produced: uint,
+    department-score: uint
+  }
+)
+
+(define-map period-leaderboard
+  { period: uint, rank-position: uint }
+  {
+    employee: principal,
+    composite-score: uint,
+    department: (string-ascii 30)
+  }
+)
+
 (define-data-var next-alert-id uint u1)
 (define-data-var next-intervention-id uint u1)
 (define-data-var analytics-enabled bool true)
+(define-data-var leaderboard-enabled bool true)
 
 (define-public (set-employee-targets 
   (employee principal) 
@@ -247,6 +285,15 @@
         (update-performance-trends employee)
         (generate-predictive-scores employee (+ period u1))
         (check-early-warnings employee)
+        true
+      )
+      true
+    )
+    
+    (if (var-get leaderboard-enabled)
+      (begin
+        (update-employee-ranking employee period)
+        (update-department-statistics employee period)
         true
       )
       true
@@ -781,5 +828,162 @@
   (match (map-get? early-warnings { alert-id: alert-id })
     alert (and (not (get resolved alert)) (not (get acknowledged alert)))
     false
+  )
+)
+
+(define-private (update-employee-ranking (employee principal) (period uint))
+  (let (
+    (employee-data (unwrap! (map-get? employees { employee: employee }) false))
+    (perf-data (unwrap! (map-get? performance { employee: employee, period: period }) false))
+    (composite (calculate-composite-score perf-data))
+    (dept-rank (calculate-department-rank employee (get department employee-data) period composite))
+    (global-rank (calculate-global-rank employee period composite))
+    (percentile-score (calculate-percentile composite))
+    (is-top (>= composite TOP-PERFORMER-THRESHOLD))
+    (rank-bonus (if is-top (calculate-ranking-bonus global-rank) u0))
+  )
+    (map-set leaderboard-rankings
+      { employee: employee, period: period }
+      {
+        composite-score: composite,
+        department-rank: dept-rank,
+        global-rank: global-rank,
+        percentile: percentile-score,
+        is-top-performer: is-top,
+        ranking-bonus: rank-bonus,
+        calculated-at-block: stacks-block-height
+      }
+    )
+    (update-period-leaderboard employee period composite (get department employee-data))
+    true
+  )
+)
+
+(define-private (update-department-statistics (employee principal) (period uint))
+  (let (
+    (employee-data (unwrap! (map-get? employees { employee: employee }) false))
+    (dept (get department employee-data))
+    (perf-data (unwrap! (map-get? performance { employee: employee, period: period }) false))
+    (current-stats (default-to 
+      {
+        total-employees: u0,
+        average-quality: u0,
+        average-delivery: u0,
+        top-performer-count: u0,
+        total-units-produced: u0,
+        department-score: u0
+      }
+      (map-get? department-stats { department: dept, period: period })))
+    (new-employee-count (+ (get total-employees current-stats) u1))
+    (new-avg-quality (/ (+ (* (get average-quality current-stats) (get total-employees current-stats)) 
+                           (get quality-score perf-data)) 
+                         new-employee-count))
+    (new-avg-delivery (/ (+ (* (get average-delivery current-stats) (get total-employees current-stats)) 
+                            (get delivery-score perf-data)) 
+                          new-employee-count))
+    (ranking-data (map-get? leaderboard-rankings { employee: employee, period: period }))
+    (is-top (match ranking-data
+              rank (get is-top-performer rank)
+              false))
+    (new-top-count (+ (get top-performer-count current-stats) (if is-top u1 u0)))
+    (new-units (+ (get total-units-produced current-stats) (get units-produced perf-data)))
+    (new-dept-score (/ (+ new-avg-quality new-avg-delivery) u2))
+  )
+    (map-set department-stats
+      { department: dept, period: period }
+      {
+        total-employees: new-employee-count,
+        average-quality: new-avg-quality,
+        average-delivery: new-avg-delivery,
+        top-performer-count: new-top-count,
+        total-units-produced: new-units,
+        department-score: new-dept-score
+      }
+    )
+    true
+  )
+)
+
+(define-private (update-period-leaderboard (employee principal) (period uint) (composite-score uint) (department (string-ascii 30)))
+  (let (
+    (global-rank (calculate-global-rank employee period composite-score))
+  )
+    (if (<= global-rank LEADERBOARD-SIZE)
+      (map-set period-leaderboard
+        { period: period, rank-position: global-rank }
+        {
+          employee: employee,
+          composite-score: composite-score,
+          department: department
+        }
+      )
+      false
+    )
+    true
+  )
+)
+
+(define-private (calculate-composite-score (perf-data {quality-score: uint, delivery-score: uint, units-produced: uint, defects: uint, on-time-deliveries: uint, total-deliveries: uint, recorded-at-block: uint}))
+  (let (
+    (quality-component (/ (* (get quality-score perf-data) QUALITY-WEIGHT) u100))
+    (delivery-component (/ (* (get delivery-score perf-data) DELIVERY-WEIGHT) u100))
+  )
+    (+ quality-component delivery-component)
+  )
+)
+
+(define-private (calculate-department-rank (employee principal) (department (string-ascii 30)) (period uint) (composite-score uint))
+  u1
+)
+
+(define-private (calculate-global-rank (employee principal) (period uint) (composite-score uint))
+  u1
+)
+
+(define-private (calculate-percentile (composite-score uint))
+  (if (>= composite-score u90) u95
+    (if (>= composite-score u80) u85
+      (if (>= composite-score u70) u70
+        (if (>= composite-score u60) u55 u40))))
+)
+
+(define-private (calculate-ranking-bonus (global-rank uint))
+  (if (is-eq global-rank u1) (/ BASE-BONUS-AMOUNT u2)
+    (if (<= global-rank u3) (/ BASE-BONUS-AMOUNT u4)
+      (if (<= global-rank u5) (/ BASE-BONUS-AMOUNT u8)
+        (/ BASE-BONUS-AMOUNT u10))))
+)
+
+(define-read-only (get-employee-ranking (employee principal) (period uint))
+  (map-get? leaderboard-rankings { employee: employee, period: period })
+)
+
+(define-read-only (get-department-statistics (department (string-ascii 30)) (period uint))
+  (map-get? department-stats { department: department, period: period })
+)
+
+(define-read-only (get-period-leaderboard-entry (period uint) (rank-position uint))
+  (map-get? period-leaderboard { period: period, rank-position: rank-position })
+)
+
+(define-read-only (get-top-performers (period uint))
+  (list 
+    (get-period-leaderboard-entry period u1)
+    (get-period-leaderboard-entry period u2)
+    (get-period-leaderboard-entry period u3)
+    (get-period-leaderboard-entry period u4)
+    (get-period-leaderboard-entry period u5)
+  )
+)
+
+(define-read-only (get-leaderboard-status)
+  (var-get leaderboard-enabled)
+)
+
+(define-public (toggle-leaderboard (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set leaderboard-enabled enabled)
+    (ok enabled)
   )
 )
