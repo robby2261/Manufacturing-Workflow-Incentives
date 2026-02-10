@@ -18,6 +18,9 @@
 (define-constant ERR-ALERT-NOT-FOUND (err u112))
 (define-constant ERR-INTERVENTION-EXISTS (err u113))
 (define-constant ERR-INVALID-RANK (err u114))
+(define-constant ERR-BADGE-ALREADY-AWARDED (err u115))
+(define-constant ERR-INVALID-BADGE (err u116))
+(define-constant ERR-MILESTONE-NOT-REACHED (err u117))
 
 ;; Contract constants
 (define-constant CONTRACT-OWNER tx-sender)
@@ -34,6 +37,15 @@
 (define-constant INTERVENTION-COOLDOWN u1440)
 (define-constant TOP-PERFORMER-THRESHOLD u90)
 (define-constant LEADERBOARD-SIZE u10)
+(define-constant MILESTONE-STREAK-BRONZE u3)
+(define-constant MILESTONE-STREAK-SILVER u5)
+(define-constant MILESTONE-STREAK-GOLD u10)
+(define-constant MILESTONE-UNITS-BRONZE u500)
+(define-constant MILESTONE-UNITS-SILVER u2000)
+(define-constant MILESTONE-UNITS-GOLD u5000)
+(define-constant BADGE-BONUS-BRONZE u250000)
+(define-constant BADGE-BONUS-SILVER u500000)
+(define-constant BADGE-BONUS-GOLD u1000000)
 
 ;; Data structures
 (define-map employees
@@ -202,6 +214,29 @@
   }
 )
 
+(define-map employee-milestones
+  { employee: principal }
+  {
+    consecutive-target-hits: uint,
+    lifetime-units-produced: uint,
+    total-periods-completed: uint,
+    best-quality-score: uint,
+    best-delivery-score: uint,
+    last-target-hit-period: uint
+  }
+)
+
+(define-map employee-badges
+  { employee: principal, badge-type: (string-ascii 20) }
+  {
+    tier: (string-ascii 10),
+    awarded-at-block: uint,
+    bonus-earned: uint
+  }
+)
+
+(define-data-var next-badge-id uint u1)
+
 (define-data-var next-alert-id uint u1)
 (define-data-var next-intervention-id uint u1)
 (define-data-var analytics-enabled bool true)
@@ -298,6 +333,7 @@
       )
       true
     )
+    (update-milestones employee period quality-score delivery-score units-produced)
     (ok true)
   )
 )
@@ -986,4 +1022,121 @@
     (var-set leaderboard-enabled enabled)
     (ok enabled)
   )
+)
+
+(define-private (update-milestones (employee principal) (period uint) (quality-score uint) (delivery-score uint) (units-produced uint))
+  (let (
+    (current-milestones (default-to
+      {
+        consecutive-target-hits: u0,
+        lifetime-units-produced: u0,
+        total-periods-completed: u0,
+        best-quality-score: u0,
+        best-delivery-score: u0,
+        last-target-hit-period: u0
+      }
+      (map-get? employee-milestones { employee: employee })))
+    (target-data (map-get? targets { employee: employee, period: period }))
+    (targets-met (match target-data
+      tdata (and (>= quality-score (get quality-target tdata)) (>= delivery-score (get delivery-target tdata)))
+      false))
+    (prev-period-was-last-hit (is-eq (get last-target-hit-period current-milestones) (- period u1)))
+    (new-streak (if targets-met
+      (if (or prev-period-was-last-hit (is-eq (get consecutive-target-hits current-milestones) u0))
+        (+ (get consecutive-target-hits current-milestones) u1)
+        u1)
+      u0))
+    (new-lifetime-units (+ (get lifetime-units-produced current-milestones) units-produced))
+    (new-best-quality (if (> quality-score (get best-quality-score current-milestones)) quality-score (get best-quality-score current-milestones)))
+    (new-best-delivery (if (> delivery-score (get best-delivery-score current-milestones)) delivery-score (get best-delivery-score current-milestones)))
+  )
+    (map-set employee-milestones
+      { employee: employee }
+      {
+        consecutive-target-hits: new-streak,
+        lifetime-units-produced: new-lifetime-units,
+        total-periods-completed: (+ (get total-periods-completed current-milestones) u1),
+        best-quality-score: new-best-quality,
+        best-delivery-score: new-best-delivery,
+        last-target-hit-period: (if targets-met period (get last-target-hit-period current-milestones))
+      }
+    )
+    true
+  )
+)
+
+(define-private (get-streak-tier (streak uint))
+  (if (>= streak MILESTONE-STREAK-GOLD) "gold"
+    (if (>= streak MILESTONE-STREAK-SILVER) "silver"
+      (if (>= streak MILESTONE-STREAK-BRONZE) "bronze" "none")))
+)
+
+(define-private (get-units-tier (units uint))
+  (if (>= units MILESTONE-UNITS-GOLD) "gold"
+    (if (>= units MILESTONE-UNITS-SILVER) "silver"
+      (if (>= units MILESTONE-UNITS-BRONZE) "bronze" "none")))
+)
+
+(define-private (get-badge-bonus (tier (string-ascii 10)))
+  (if (is-eq tier "gold") BADGE-BONUS-GOLD
+    (if (is-eq tier "silver") BADGE-BONUS-SILVER
+      (if (is-eq tier "bronze") BADGE-BONUS-BRONZE u0)))
+)
+
+(define-public (claim-milestone-badge (employee principal) (badge-type (string-ascii 20)))
+  (let (
+    (employee-data (unwrap! (map-get? employees { employee: employee }) ERR-EMPLOYEE-NOT-FOUND))
+    (milestone-data (unwrap! (map-get? employee-milestones { employee: employee }) ERR-EMPLOYEE-NOT-FOUND))
+    (existing-badge (map-get? employee-badges { employee: employee, badge-type: badge-type }))
+    (earned-tier (if (is-eq badge-type "streak-master")
+      (get-streak-tier (get consecutive-target-hits milestone-data))
+      (if (is-eq badge-type "production-hero")
+        (get-units-tier (get lifetime-units-produced milestone-data))
+        "none")))
+    (bonus (get-badge-bonus earned-tier))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (get active employee-data) ERR-EMPLOYEE-NOT-FOUND)
+    (asserts! (not (is-eq earned-tier "none")) ERR-MILESTONE-NOT-REACHED)
+    (asserts! (or (is-eq badge-type "streak-master") (is-eq badge-type "production-hero")) ERR-INVALID-BADGE)
+    (match existing-badge
+      badge (asserts! (not (is-eq (get tier badge) earned-tier)) ERR-BADGE-ALREADY-AWARDED)
+      true
+    )
+    (map-set employee-badges
+      { employee: employee, badge-type: badge-type }
+      {
+        tier: earned-tier,
+        awarded-at-block: stacks-block-height,
+        bonus-earned: bonus
+      }
+    )
+    (if (and (> bonus u0) (>= (stx-get-balance (as-contract tx-sender)) bonus))
+      (begin
+        (try! (as-contract (stx-transfer? bonus tx-sender employee)))
+        (map-set employees
+          { employee: employee }
+          (merge employee-data { total-rewards-earned: (+ (get total-rewards-earned employee-data) bonus) })
+        )
+        (ok { tier: earned-tier, bonus: bonus })
+      )
+      (ok { tier: earned-tier, bonus: u0 })
+    )
+  )
+)
+
+(define-read-only (get-employee-milestones (employee principal))
+  (map-get? employee-milestones { employee: employee })
+)
+
+(define-read-only (get-employee-badge (employee principal) (badge-type (string-ascii 20)))
+  (map-get? employee-badges { employee: employee, badge-type: badge-type })
+)
+
+(define-read-only (get-employee-badge-summary (employee principal))
+  {
+    streak-badge: (map-get? employee-badges { employee: employee, badge-type: "streak-master" }),
+    production-badge: (map-get? employee-badges { employee: employee, badge-type: "production-hero" }),
+    milestones: (map-get? employee-milestones { employee: employee })
+  }
 )
